@@ -1358,5 +1358,46 @@ def sample_ray(img, msk, K, R, T, bounds, nrays, split):
 #         print(i)
 
 
-# if __name__ == "__main__":
-#     main()
+if __name__ == "__main__":
+    import torch
+    data_root = 'data/h36m/S1/Posing'
+    split = 'train'
+    dataset = H36MDatasetPair(
+        data_root=data_root,
+        split=split,
+        view_num=3,
+        border=5,
+        N_rand=1000,
+        image_scaling=1.,
+        multi_person=1,
+        num_instance=6,
+        start=0,
+        interval=10,
+        poses_num=100,
+        random_pair=1,
+        mean_shape=0,
+        new_mask=0,
+        test_persons=0,
+    )
+    data = dataset[0]
+    def print_shape(k, x, d=0):
+        if isinstance(x, torch.Tensor):
+            print('\t' * d, k, x.shape)
+        elif isinstance(x, np.ndarray):
+            print('\t' * d, k, x.shape)
+        elif isinstance(x, dict):
+            print('\t' * d, '{} = {}'.format(k, '{'))
+            for k2 in x:
+                print_shape(k2, x[k2], d+1)
+            print('\t' * d, '}')
+        elif isinstance(x, tuple):
+            print('\t' * d, '(')
+            for k2 in x:
+                print_shape(k2, x[k2], d+1)
+            print('\t' * d,')')
+        else:
+            print('\t' * d, k, x)
+        
+    for k in data:
+        print_shape(k, data[k])
+    # dataset = 

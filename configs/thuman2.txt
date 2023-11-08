@@ -29,17 +29,17 @@ skinning_field = 0
 append_rgb = 1
 ddp = 0
 
-model = skinning_batch
+model = smplx_skinning_batch
 mean_shape = 0
-batch_size = 2
+batch_size = 1
 
 
-num_worker = 16
+num_worker = 4
 train_split = train
 start = 0
 view_num = 3
 
-data_set_type = H36M_P
+data_set_type = pointhuman
 
 
 basedir = ./logs
@@ -59,7 +59,8 @@ num_instance = 6
 multi_person = 1
 test_num_instance = 1
 test_persons = 0
-data_root = ./data/h36m/S1/Posing
-expname = S1
+data_root = ./data/thuman2
+render_root = thuman2_perspective_nolight_36views
+expname = thuman2
 
 

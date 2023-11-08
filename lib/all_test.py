@@ -19,7 +19,12 @@ from lib.h36m_dataset import H36MDataset, H36MDatasetBatch, H36MDatasetPair, H36
 from lib.THuman_dataset import THumanDataset, THumanDatasetBatch, THumanDatasetPair
 import torch.distributions as tdist
 from model_selection import *
-from skimage.measure import compare_ssim
+try:
+    from skimage.measure import compare_ssim
+except:
+    from skimage.metrics import structural_similarity as compare_ssim
+import os.path as osp
+from tqdm import tqdm
 
 import json 
 
@@ -582,3 +587,72 @@ def test_H36M(chunk, render_kwargs, savedir=None, global_args=None, device=None,
     
     return
 
+
+def test_pointhuman(chunk, render_kwargs, savedir=None, global_args=None, device=None, render=None):
+    torch.set_default_tensor_type(torch.FloatTensor)
+    # test_set = PointHumanDataset(
+    #     data_folder=global_args.data_root,
+    #     split="test",
+    #     render_folder=global_args.render_root,
+    #     N_rand=global_args.N_rand,
+    #     num_ref_views=global_args.view_num,
+    # )
+    # test_set.initialize_for_test()
+    test_set = PointHumanDataset.from_config(None, "test", global_args)
+    torch.set_default_tensor_type(torch.cuda.FloatTensor)
+    test_dataloader = DataLoader(
+        test_set, batch_size=1,
+        num_workers=0, shuffle=False,
+        drop_last=False)
+
+    print("Begin to test")
+    testsavedir = savedir
+    os.makedirs(testsavedir, exist_ok=True)
+    render_kwargs['network_fn'].eval()
+
+    video_writter = None
+    last_output_folder = None
+    device = torch.device('cuda:0')
+    for data in tqdm(test_dataloader):
+        data = to_cuda(device, data)
+        scan_id = data['scan_id'][0]
+        ref_views = data['ref_views'][0]
+        tgt_view = data['tgt_view'][0]
+        sp_input = data
+        tp_input = data
+
+        k = 0   # target view index is 0
+        batch_rays = torch.stack([tp_input['ray_o_all'][:,k], tp_input['ray_d_all'][:,k]], 1) # (B,2,N_rand,3)
+        near=tp_input['near_all'][:,k]
+        far=tp_input['far_all'][:,k]
+        target_img = tp_input['o_img_all'][:, k]
+        target_s = tp_input['rgb_all'][:, k]
+        msk = tp_input['msk_all'][:,k]
+        mask_at_box = tp_input['mask_at_box_all'][:,k]
+
+        rgb, disp, acc, extras = render(chunk=chunk, rays=batch_rays, sp_input=sp_input, tp_input=tp_input,
+                                        near=near, far=far, **render_kwargs)
+        H = test_set.H
+        W = test_set.W
+        rgb = rgb.reshape(H, W, 3)
+        # target_s = target_s.reshape(H, W, 3)
+        # msk = msk.reshape(H, W)
+        # mask_at_box = mask_at_box.reshape(512, 512)
+
+        target_img = target_img[0].permute(1, 2, 0).cpu().numpy()
+        render_img = rgb.cpu().numpy()
+
+        output_folder = osp.join(testsavedir, scan_id, ref_views)
+        if last_output_folder != output_folder:
+            if video_writter is not None:
+                video_writter.close()
+            os.makedirs(output_folder, exist_ok=True)
+            video_writter = imageio.get_writer(
+                osp.join(output_folder, f"{tgt_view}.mp4"), fps=5)
+            last_output_folder = output_folder
+
+        result_img = np.concatenate([target_img, render_img], axis=1)
+        result_img = (result_img * 255).astype(np.uint8)
+        Image.fromarray(result_img, "RGB").save(
+            osp.join(output_folder, f"{tgt_view}.png"))
+        video_writter.append_data(result_img)

@@ -11,6 +11,8 @@ import cv2
 from memory_profiler import profile
 import os
 from PIL import Image, ImageDraw, ImageFont
+from smplx.lbs import blend_shapes, vertices2joints, batch_rodrigues, batch_rigid_transform
+
 # Misc
 img2mse = lambda x, y : torch.mean((x - y) ** 2)
 mse2psnr = lambda x : -10. * torch.log(x) / torch.log(torch.Tensor([10.]))
@@ -182,11 +184,11 @@ def batch_rodrigues_torch(poses):
     sin = torch.sin(angle)[:, None]
 
     rx, ry, rz = torch.split(rot_dir, 1, dim=1)
-    zeros = torch.zeros([batch_size, 1])
+    zeros = torch.zeros([batch_size, 1]).cuda()
     K = torch.cat([zeros, -rz, ry, rz, zeros, -rx, -ry, rx, zeros], dim=1)
     K = K.reshape([batch_size, 3, 3])
 
-    ident = torch.eye(3)[None]
+    ident = torch.eye(3)[None].cuda()
     rot_mat = ident + sin * K + (1 - cos) * torch.matmul(K, K)
 
     return rot_mat
@@ -199,12 +201,13 @@ def get_rigid_transformation_torch(rot_mats, joints, parents):
     parents: 24
     """
     # obtain the relative joints
+    nJ = joints.shape[0]
     rel_joints = joints.clone()
     rel_joints[1:] -= joints[parents[1:]]
 
     # create the transformation matrix
     transforms_mat = torch.cat([rot_mats, rel_joints[..., None]], dim=2)
-    padding = torch.zeros([24, 1, 4]).cuda()
+    padding = torch.zeros([nJ, 1, 4]).cuda()
     padding[..., 3] = 1
     transforms_mat = torch.cat([transforms_mat, padding], dim=1)
 
@@ -216,7 +219,7 @@ def get_rigid_transformation_torch(rot_mats, joints, parents):
     transforms = torch.stack(transform_chain, dim=0)
 
     # obtain the rigid transformation
-    padding = torch.zeros([24, 1]).cuda()
+    padding = torch.zeros([nJ, 1]).cuda()
     joints_homogen = torch.cat([joints, padding], dim=1)
     rel_joints = torch.sum(transforms * joints_homogen[:, None], dim=2)
     transforms[..., 3] = transforms[..., 3] - rel_joints
@@ -251,6 +254,64 @@ def get_transform_params_torch(smpl, params):
     R = params['R'] #.to(device)
     Th = params['Th'] #.to(device)
 
+    return A, R, Th, joints
+
+
+def get_smplx_transform_params_torch(smpl, params, bigparams=False):
+    """ obtain the transformation parameters for linear blend skinning
+    """
+    device = params['shapes'].device
+    v_template = smpl.v_template
+
+    # add shape blend shapes
+    shapedirs = smpl.shapedirs
+    expr_dirs = smpl.expr_dirs
+    shapedirs = torch.cat([shapedirs, expr_dirs], dim=-1)
+
+    betas = params['shapes']
+    expression = params['expression']
+    shape_components = torch.cat([betas, expression], dim=-1)
+    v_shaped = v_template + torch.sum(shapedirs * shape_components[None], axis=2).float()
+    joints = torch.matmul(smpl.J_regressor, v_shaped) # v
+
+    # add pose blend shapes
+    global_orient = params['global_orient']
+    body_pose = params['body_pose']
+    jaw_pose = params['jaw_pose']
+    left_hand_pose = params['left_hand_pose']
+    right_hand_pose = params['right_hand_pose']
+    leye_pose = params['leye_pose']
+    reye_pose = params['reye_pose']
+
+    left_hand_pose = left_hand_pose @ smpl.left_hand_components
+    right_hand_pose = right_hand_pose @ smpl.right_hand_components
+    full_pose = torch.cat([global_orient.reshape(1, 3),
+                            body_pose.reshape(smpl.NUM_BODY_JOINTS, 3),
+                            jaw_pose.reshape(1, 3),
+                            leye_pose.reshape(1, 3),
+                            reye_pose.reshape(1, 3),
+                            left_hand_pose.reshape(15, 3),
+                            right_hand_pose.reshape(15, 3)],
+                            dim=0).reshape(165)
+    if not bigparams:
+        full_pose += smpl.pose_mean
+    else:
+        full_pose = torch.zeros_like(full_pose)
+        full_pose = full_pose.view(-1, 3)
+        full_pose[1, 2] = np.deg2rad(30.)
+        full_pose[2, 2] = -np.deg2rad(30.)
+    
+    full_pose = full_pose.view(-1, 3)
+    # 55 x 3 x 3
+    rot_mats = batch_rodrigues_torch(full_pose)
+
+    # obtain the rigid transformation
+    parents = smpl.parents
+    A = get_rigid_transformation_torch(rot_mats, joints, parents)
+
+    # apply global transformation
+    R = params['R'] #.to(device)
+    Th = params['Th'] #.to(device)
     return A, R, Th, joints
 
 

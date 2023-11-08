@@ -40,6 +40,8 @@ def config_parser():
     # dataset options
     parser.add_argument("--data_root", type=str, default='msra_h36m/S9/Posing', 
                         help='Dataset root dir')
+    parser.add_argument("--render_root", type=str, default='thuman2_perspective_nolight_36views', 
+                        help='Render root dir for pointhuman dataset.')
     parser.add_argument("--data_set_type", type=str, default='multi_pair', 
                         help='Dataset root dir')
     parser.add_argument("--train_split", type=str, default="test", 

@@ -1,9 +1,10 @@
-from lib.skinnning_batch import CorrectionBatchBlend, DirectDeform, SKinningBatch, CorrectionBatch
+from lib.skinnning_batch import CorrectionBatchBlend, DirectDeform, SKinningBatch, SMPLXSKinningBatch, CorrectionBatch
 from lib.correction import CorrectionByf3d, CorrectionByUvhAgg
 from lib.run_nerf_helpers import *
 from parser_config import *
 from lib.h36m_dataset import H36MDataset, H36MDatasetBatch, H36MDatasetBatchAll, H36MDatasetPair
 from lib.THuman_dataset import THumanDataset, THumanDatasetBatch, THumanDatasetPair, THumanDatasetBatchRandom
+from lib.pointhuman_dataset import PointHumanDataset
 
 def return_model(global_args):
     if global_args.model == 'correction_by_f3d':
@@ -20,6 +21,21 @@ def return_model(global_args):
                         )
     elif global_args.model == 'skinning_batch':
         Human_NeRF = SKinningBatch(
+                        human_sample=global_args.human_sample,
+                        density_loss=global_args.density_loss, 
+                        with_viewdirs=global_args.with_viewdirs, 
+                        use_f2d=global_args.use_f2d,
+                        use_trans=global_args.use_trans,
+                        smooth_loss=global_args.smooth_loss,
+                        num_instances=global_args.num_instance,
+                        mean_shape=global_args.mean_shape,
+                        correction_field=global_args.correction_field, 
+                        skinning_field=global_args.skinning_field,
+                        data_set_type=global_args.data_set_type,
+                        append_rgb=global_args.append_rgb
+                        )
+    elif global_args.model == 'smplx_skinning_batch':
+        Human_NeRF = SMPLXSKinningBatch(
                         human_sample=global_args.human_sample,
                         density_loss=global_args.density_loss, 
                         with_viewdirs=global_args.with_viewdirs, 
@@ -223,6 +239,21 @@ def return_dataset(global_args, pairs=None):
             interval=global_args.interval, 
             poses_num=global_args.poses_num
         )
+    elif global_args.data_set_type=="pointhuman":
+        torch.set_default_tensor_type(torch.FloatTensor)
+        training_set = PointHumanDataset(
+            data_folder=global_args.data_root,
+            split=global_args.train_split,
+            render_folder=global_args.render_root,
+            N_rand=global_args.N_rand,
+            num_ref_views=global_args.view_num,
+            num_views=36,
+            num_rotations=36,
+            H=512,
+            W=512,
+            ratio=1.,
+        )
+        torch.set_default_tensor_type('torch.cuda.FloatTensor')
     
     
     else:

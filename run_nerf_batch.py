@@ -18,7 +18,7 @@ from lib.h36m_dataset import H36MDataset, H36MDatasetBatch, H36MDatasetPair, H36
 from lib.THuman_dataset import THumanDataset, THumanDatasetBatch, THumanDatasetPair
 import torch.distributions as tdist
 from model_selection import *
-from lib.all_test import test_H36M, test_THuman_ssim
+from lib.all_test import test_H36M, test_THuman_ssim, test_pointhuman
 
 parser = config_parser()
 global_args = parser.parse_args()
@@ -372,20 +372,20 @@ def raw2outputs(raw, z_vals, rays_d, white_bkgd=False):
     if not global_args.occupancy:
         raw2alpha = lambda raw, dists, act_fn=density_actfn: 1.-torch.exp(-act_fn(raw)*dists)
         dists = z_vals[...,1:] - z_vals[...,:-1]
-        dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
+        dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[...,:1].shape).cuda()], -1)  # [N_rays, N_samples]
         dists = dists * torch.norm(rays_d[...,None,:], dim=-1)
         rgb = rgb_actfn(raw[...,:3])  # [N_rays, N_samples, 3]
         # rgb = torch.sigmoid(raw[...,:3])  # [N_rays, N_samples, 3]
         noise = 0.
         alpha = raw2alpha(raw[...,3] + noise, dists)  # [N_rays, N_samples]
-        weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], alpha.shape[1], 1)), 1.-alpha + 1e-10], -1), -1)[:, :, :-1]
+        weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], alpha.shape[1], 1)).cuda(), 1.-alpha + 1e-10], -1), -1)[:, :, :-1]
         # weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
     else:
         rgb = rgb_actfn(raw[...,:3])  # [N_rays, N_samples, 3]
         alpha = rgb_actfn(raw[...,3])  # [N_rays, N_samples]
-        weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], alpha.shape[1], 1)), 1.-alpha + 1e-10], -1), -1)[:, :, :-1]
+        weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], alpha.shape[1], 1)).cuda(), 1.-alpha + 1e-10], -1), -1)[:, :, :-1]
     
-    T_s = torch.cumprod(torch.cat([torch.ones((alpha.shape[0], alpha.shape[1], 1)), 1.-alpha + 1e-10], -1), -1)[:, :, :-1]
+    T_s = torch.cumprod(torch.cat([torch.ones((alpha.shape[0], alpha.shape[1], 1)).cuda(), 1.-alpha + 1e-10], -1), -1)[:, :, :-1]
     rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
     depth_map = torch.sum(weights * z_vals, -1)
     disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))
@@ -408,7 +408,7 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
     bounds = torch.reshape(ray_batch[...,6:8], [ray_batch.shape[0],-1,1,2])
     near, far = bounds[...,0], bounds[...,1] # [-1,1]
 
-    t_vals = torch.linspace(0., 1., steps=N_samples)
+    t_vals = torch.linspace(0., 1., steps=N_samples, device=near.device)
     z_vals = near * (1.-t_vals) + far * (t_vals)
     # z_vals = z_vals.expand([N_rays, N_samples])
 
@@ -418,7 +418,7 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
         upper = torch.cat([mids, z_vals[...,-1:]], -1)
         lower = torch.cat([z_vals[...,:1], mids], -1)
         # stratified samples in those intervals
-        t_rand = torch.rand(z_vals.shape)
+        t_rand = torch.rand(z_vals.shape, device=upper.device)
         z_vals = lower + (upper - lower) * t_rand
 
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
@@ -446,21 +446,58 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples,
 
 def train(nprocs, global_args):
     args = global_args
+    basedir = args.basedir
+    expname = args.expname
+    os.makedirs(os.path.join(basedir, expname), exist_ok=True)
     training_set = return_dataset(global_args)
 
     if args.ddp:
         train_sampler = torch.utils.data.distributed.DistributedSampler(training_set)
         training_loader = DataLoader(training_set, batch_size=1, num_workers=0, sampler=train_sampler)
     else:
-        training_loader = DataLoader(training_set, batch_size=global_args.batch_size, shuffle=True, num_workers=global_args.num_worker, pin_memory=False)
+        training_loader = DataLoader(
+            training_set, batch_size=global_args.batch_size,
+            shuffle=True, num_workers=global_args.num_worker,
+            pin_memory=False, generator=torch.Generator(device='cuda'))
     
     # Multi-GPU
     args.n_gpus = torch.cuda.device_count()
     print("Using {} GPU(s).".format(args.n_gpus))
 
+    # Create nerf model
+    render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
+    global_step = start
+    N_iters = global_args.N_iteration + 1
+
+    if global_args.save_weights == 0:
+        print("Begin to test, save_weights == 0")
+        testsavedir = os.path.join(basedir, expname, 'testset_{:06d}_more_real_ssim_psnr'.format(global_step))
+        os.makedirs(testsavedir, exist_ok=True)
+        render_kwargs_train['network_fn'].eval()
+        with torch.no_grad():
+            if global_args.data_set_type in ["H36M_B", "H36M", "H36M_P"]:
+                # test(args.chunk, render_kwargs_train, savedir=testsavedir, test_more=True)
+                test_H36M(args.chunk, render_kwargs_train, savedir=testsavedir, global_args=global_args, device=device, render=render, test_persons=global_args.test_persons)
+            elif global_args.data_set_type in ["THuman_B"]:
+                test_THuman_ssim(args.chunk, render_kwargs_train, savedir=testsavedir, global_args=global_args, device=device, render=render)
+                # test_THuman(args.chunk, render_kwargs_train, savedir=testsavedir, global_args=global_args, device=device, render=render)
+                # test(args.chunk, render_kwargs_train, savedir=testsavedir, test_more=True)
+            elif global_args.data_set_type in ["pointhuman"]:
+                testsavedir = os.path.join(
+                    args.basedir,
+                    args.expname,
+                    'test_vis')
+                test_pointhuman(args.chunk, render_kwargs_train, savedir=testsavedir, global_args=global_args, device=device, render=render)
+            else:
+                test(args.chunk, render_kwargs_train, savedir=testsavedir, test_more=True)
+                
+        render_kwargs_train['network_fn'].train()
+        print('Saved test set')
+        global_args.save_weights = 1
+
+        return
+
     # Create log dir and copy the config file
-    basedir = args.basedir
-    expname = args.expname
     os.makedirs(os.path.join(basedir, expname), exist_ok=True)
     f = os.path.join(basedir, expname, 'args.txt')
     with open(f, 'w') as file:
@@ -471,11 +508,6 @@ def train(nprocs, global_args):
         f = os.path.join(basedir, expname, 'config.txt')
         with open(f, 'w') as file:
             file.write(open(args.config, 'r').read())
-
-    # Create nerf model
-    render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
-    global_step = start
-    N_iters = global_args.N_iteration + 1
 
     # Summary writers
     # global writer
@@ -496,27 +528,6 @@ def train(nprocs, global_args):
     running_cor_smooth_loss = 0.0
     running_smpl_normal_loss = 0.0
 
-    if global_args.save_weights == 0:
-        print("Begin to test, save_weights == 0")
-        testsavedir = os.path.join(basedir, expname, 'testset_{:06d}_more_real_ssim_psnr'.format(global_step))
-        os.makedirs(testsavedir, exist_ok=True)
-        render_kwargs_train['network_fn'].eval()
-        with torch.no_grad():
-            if global_args.data_set_type in ["H36M_B", "H36M", "H36M_P"]:
-                # test(args.chunk, render_kwargs_train, savedir=testsavedir, test_more=True)
-                test_H36M(args.chunk, render_kwargs_train, savedir=testsavedir, global_args=global_args, device=device, render=render, test_persons=global_args.test_persons)
-            elif global_args.data_set_type in ["THuman_B"]:
-                test_THuman_ssim(args.chunk, render_kwargs_train, savedir=testsavedir, global_args=global_args, device=device, render=render)
-                # test_THuman(args.chunk, render_kwargs_train, savedir=testsavedir, global_args=global_args, device=device, render=render)
-                # test(args.chunk, render_kwargs_train, savedir=testsavedir, test_more=True)
-            else:
-                test(args.chunk, render_kwargs_train, savedir=testsavedir, test_more=True)
-                
-        render_kwargs_train['network_fn'].train()
-        print('Saved test set')
-        global_args.save_weights = 1
-
-        return
     
     # for global_step in range(start, N_iters, skip_step * len(training_loader)):
     while global_step < N_iters:
@@ -657,5 +668,6 @@ def cleanup():
 if __name__=='__main__':
     torch.set_default_tensor_type('torch.cuda.FloatTensor')
     print_args(global_args)
-    torch.multiprocessing.set_start_method('spawn', force=True)
+    if global_args.ddp:
+        torch.multiprocessing.set_start_method('spawn', force=True)
     train(torch.cuda.device_count(), global_args)
